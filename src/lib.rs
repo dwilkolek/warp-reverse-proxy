@@ -3,10 +3,10 @@
 //!
 //!
 //! ```no_run
-//! use warp::{hyper::Body, Filter, Rejection, Reply, http::Response};
-//! use warp_reverse_proxy::reverse_proxy_filter;
+//! use warp::{Filter, Rejection, Reply};
+//! use warp_reverse_proxy::{reverse_proxy_filter, ProxyResponse};
 //!
-//! async fn log_response(response: Response<Body>) -> Result<impl Reply, Rejection> {
+//! async fn log_response(response: ProxyResponse) -> Result<impl Reply, Rejection> {
 //!     println!("{:?}", response);
 //!     Ok(response)
 //! }
@@ -37,8 +37,21 @@ use warp::filters::path::FullPath;
 use warp::http;
 use warp::http::{HeaderMap, HeaderValue, Method as RequestMethod};
 use warp::hyper::body::Bytes;
-use warp::hyper::Body;
 use warp::{Filter, Rejection};
+
+#[derive(Debug)]
+pub struct ProxyResponse(http::Response<Bytes>);
+
+impl warp::Reply for ProxyResponse {
+    fn into_response(self) -> warp::reply::Response {
+        let (parts, body) = self.0.into_parts();
+        let mut response = warp::reply::Response::new(body.into());
+        *response.status_mut() = parts.status;
+        *response.headers_mut() = parts.headers;
+        *response.version_mut() = parts.version;
+        response
+    }
+}
 
 /// Reverse proxy internal client
 ///
@@ -92,7 +105,7 @@ pub type Request = (Uri, QueryParameters, Method, Headers, Bytes);
 pub fn reverse_proxy_filter(
     base_path: String,
     proxy_address: String,
-) -> impl Filter<Extract = (http::Response<Body>,), Error = Rejection> + Clone {
+) -> impl Filter<Extract = (ProxyResponse,), Error = Rejection> + Clone {
     let proxy_address = warp::any().map(move || proxy_address.clone());
     let base_path = warp::any().map(move || base_path.clone());
     let data_filter = extract_request_data_filter();
@@ -101,6 +114,7 @@ pub fn reverse_proxy_filter(
         .and(base_path)
         .and(data_filter)
         .and_then(proxy_to_and_forward_response)
+        .map(ProxyResponse)
         .boxed()
 }
 
@@ -149,10 +163,10 @@ pub fn extract_request_data_filter(
 /// provides the `(Uri, QueryParameters, Method, Headers, Body)` needed for calling this method. But the `proxy_address`
 /// and the `base_path` arguments need to be provided too.
 /// ```rust, ignore
-/// use warp::{Filter, hyper::Body, Reply, Rejection, hyper::Response};
-/// use warp_reverse_proxy::{extract_request_data_filter, proxy_to_and_forward_response};
+/// use warp::{Filter, Reply, Rejection};
+/// use warp_reverse_proxy::{extract_request_data_filter, proxy_to_and_forward_response, ProxyResponse};
 ///
-/// async fn log_response(response: Response<Body>) -> Result<impl Reply, Rejection> {
+/// async fn log_response(response: ProxyResponse) -> Result<impl Reply, Rejection> {
 ///     println!("{:?}", response);
 ///     Ok(response)
 /// }
@@ -163,6 +177,7 @@ pub fn extract_request_data_filter(
 ///     .untuple_one()
 ///     .and(request_filter)
 ///     .and_then(proxy_to_and_forward_response)
+///     .map(warp_reverse_proxy::ProxyResponse)
 ///     .and_then(log_response);
 /// ```
 pub async fn proxy_to_and_forward_response(
@@ -173,7 +188,7 @@ pub async fn proxy_to_and_forward_response(
     method: Method,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<http::Response<Body>, Rejection> {
+) -> Result<http::Response<Bytes>, Rejection> {
     let proxy_uri = remove_relative_path(&uri, base_path, proxy_address);
     let request = filtered_data_to_request(proxy_uri, (uri, params, method, headers, body))
         .map_err(warp::reject::custom)?;
@@ -186,13 +201,15 @@ pub async fn proxy_to_and_forward_response(
 /// Converts a reqwest response into a http::Response
 async fn response_to_reply(
     response: reqwest::Response,
-) -> Result<http::Response<Body>, errors::Error> {
+) -> Result<http::Response<Bytes>, errors::Error> {
     let mut builder = http::Response::builder();
     for (k, v) in remove_hop_headers(response.headers()).iter() {
         builder = builder.header(k, v);
     }
     let status = response.status();
-    let body = Body::wrap_stream(response.bytes_stream());
+
+    let body = response.bytes().await.map_err(errors::Error::Request)?;
+
     builder
         .status(status)
         .body(body)
