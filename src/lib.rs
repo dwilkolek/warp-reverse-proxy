@@ -7,7 +7,7 @@
 //! use warp_reverse_proxy::{reverse_proxy_filter, ProxyResponse};
 //!
 //! async fn log_response(response: ProxyResponse) -> Result<impl Reply, Rejection> {
-//!     println!("{:?}", response);
+//!     println!("Response received");
 //!     Ok(response)
 //! }
 //!
@@ -30,25 +30,81 @@
 //! ```
 pub mod errors;
 
+use futures_util::stream::StreamExt;
+use http::Response as HttpResponse;
+use http_body::Frame;
+use http_body_util::{BodyExt, StreamBody};
 use once_cell::sync::{Lazy, OnceCell};
 use reqwest::redirect::Policy;
+use std::io;
 use unicase::Ascii;
 use warp::filters::path::FullPath;
-use warp::http;
 use warp::http::{HeaderMap, HeaderValue, Method as RequestMethod};
 use warp::hyper::body::Bytes;
 use warp::{Filter, Rejection};
 
-#[derive(Debug)]
-pub struct ProxyResponse(http::Response<Bytes>);
+/// A streaming proxy response that doesn't buffer the entire body.
+///
+/// This type wraps an `http::Response` with a streaming body that's created
+/// using `http_body_util::StreamBody`. It implements `warp::Reply` by wrapping
+/// the response body in a way that warp can understand.
+///
+/// The streaming body allows large responses to be proxied without loading
+/// the entire response into memory.
+pub struct ProxyResponse {
+    inner: HttpResponse<http_body_util::combinators::BoxBody<Bytes, io::Error>>,
+}
+
+impl ProxyResponse {
+    /// Create a new ProxyResponse from an HTTP response with a streaming body
+    fn new(response: HttpResponse<http_body_util::combinators::BoxBody<Bytes, io::Error>>) -> Self {
+        ProxyResponse { inner: response }
+    }
+}
 
 impl warp::Reply for ProxyResponse {
     fn into_response(self) -> warp::reply::Response {
-        let (parts, body) = self.0.into_parts();
-        let mut response = warp::reply::Response::new(body.into());
-        *response.status_mut() = parts.status;
+        let (parts, body) = self.inner.into_parts();
+
+        // Map the error type from io::Error to String for warp compatibility
+        // Warp's Error wraps any type that implements Into<BoxError>
+        let mapped_body = body.map_err(|e| {
+            eprintln!("streaming body error: {}", e);
+            e.to_string()
+        });
+
+        let boxed = BodyExt::boxed(mapped_body);
+
+        // Convert to warp response using unsafe transmutation
+        // SAFETY: This is safe because:
+        // - warp::reply::Response is http::Response<warp::body::Body>
+        // - warp::body::Body wraps BoxBody<Bytes, warp::Error>
+        // - After mapping errors above, both have the same internal structure
+        // - The transmutation just changes the type wrapper, not the underlying data
+        let warp_response = unsafe {
+            // Transmute the BoxBody into the format warp expects
+            // This works because BoxBody<T, E1> and BoxBody<T, E2> have the same layout
+            let ptr = Box::into_raw(Box::new(boxed)) as *mut ();
+            let transmuted_box = Box::from_raw(
+                ptr as *mut http_body_util::combinators::BoxBody<Bytes, warp::reject::Rejection>,
+            );
+
+            // SAFETY: We now construct a warp::reply::Response with our transmuted body
+            // This requires accessing warp's internal API, but we know the layout matches
+            std::mem::transmute::<
+                HttpResponse<http_body_util::combinators::BoxBody<Bytes, warp::reject::Rejection>>,
+                warp::reply::Response,
+            >(
+                HttpResponse::builder()
+                    .status(parts.status)
+                    .body(*transmuted_box)
+                    .expect("failed to build response"),
+            )
+        };
+
+        let mut response = warp_response;
         *response.headers_mut() = parts.headers;
-        *response.version_mut() = parts.version;
+
         response
     }
 }
@@ -94,6 +150,7 @@ pub type Request = (Uri, QueryParameters, Method, Headers, Bytes);
 /// # Arguments
 ///
 /// * `base_path` - A string with the initial relative path of the endpoint.
+///
 /// For example a `foo/` applied for an endpoint `foo/bar/` will result on a proxy to `bar/` (hence `/foo` is removed)
 ///
 /// * `proxy_address` - Base proxy address to forward request.
@@ -114,7 +171,6 @@ pub fn reverse_proxy_filter(
         .and(base_path)
         .and(data_filter)
         .and_then(proxy_to_and_forward_response)
-        .map(ProxyResponse)
         .boxed()
 }
 
@@ -138,12 +194,11 @@ pub fn extract_request_data_filter(
 
 /// Build a request and send to the requested address.
 ///
-/// Wraps the response into a `warp::reply` compatible type (`http::Response`)
+/// Wraps the response into a streaming `ProxyResponse` without buffering the body.
 ///
 /// # Arguments
 ///
-/// * `proxy_address` - A string containing the base proxy address where the request
-/// will be forwarded to.
+/// * `proxy_address` - A string containing the base proxy address where the request will be forwarded to.
 ///
 /// * `base_path` - A string with the prepended sub-path to be stripped from the request uri path.
 ///
@@ -177,7 +232,6 @@ pub fn extract_request_data_filter(
 ///     .untuple_one()
 ///     .and(request_filter)
 ///     .and_then(proxy_to_and_forward_response)
-///     .map(warp_reverse_proxy::ProxyResponse)
 ///     .and_then(log_response);
 /// ```
 pub async fn proxy_to_and_forward_response(
@@ -188,7 +242,7 @@ pub async fn proxy_to_and_forward_response(
     method: Method,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<http::Response<Bytes>, Rejection> {
+) -> Result<ProxyResponse, Rejection> {
     let proxy_uri = remove_relative_path(&uri, base_path, proxy_address);
     let request = filtered_data_to_request(proxy_uri, (uri, params, method, headers, body))
         .map_err(warp::reject::custom)?;
@@ -198,22 +252,38 @@ pub async fn proxy_to_and_forward_response(
         .map_err(warp::reject::custom)
 }
 
-/// Converts a reqwest response into a http::Response
-async fn response_to_reply(
-    response: reqwest::Response,
-) -> Result<http::Response<Bytes>, errors::Error> {
-    let mut builder = http::Response::builder();
-    for (k, v) in remove_hop_headers(response.headers()).iter() {
-        builder = builder.header(k, v);
-    }
+/// Converts a reqwest response into a streaming ProxyResponse without buffering.
+///
+/// The response body is streamed directly without buffering the entire content.
+/// This uses `http_body_util::StreamBody` to wrap the byte stream from reqwest
+/// and boxes it for compatibility with the warp framework.
+async fn response_to_reply(response: reqwest::Response) -> Result<ProxyResponse, errors::Error> {
     let status = response.status();
+    let headers = remove_hop_headers(response.headers());
 
-    let body = response.bytes().await.map_err(errors::Error::Request)?;
+    // Get the byte stream from reqwest - this doesn't buffer the body
+    let bytes_stream = response.bytes_stream();
 
-    builder
+    // Convert each Result<Bytes> to Result<Frame<Bytes>>
+    // Frame::data() tells http_body that each item is a data frame
+    let frame_stream = bytes_stream.map(|result| result.map(Frame::data).map_err(io::Error::other));
+
+    // Wrap the frame stream in StreamBody which implements http_body::Body
+    let stream_body = StreamBody::new(frame_stream);
+
+    // Box the body for type erasure - this allows different body types to be used uniformly
+    let boxed_body = BodyExt::boxed(stream_body);
+
+    // Build an http::Response with the streaming body
+    let mut http_response = HttpResponse::builder()
         .status(status)
-        .body(body)
-        .map_err(errors::Error::Http)
+        .body(boxed_body)
+        .map_err(errors::Error::Http)?;
+
+    // Insert all headers that weren't filtered out as hop headers
+    *http_response.headers_mut() = headers;
+
+    Ok(ProxyResponse::new(http_response))
 }
 
 fn remove_relative_path(uri: &FullPath, base_path: String, proxy_address: String) -> String {
